@@ -58,6 +58,29 @@ def has_sufficient_changes(pr) -> tuple[bool, str]:
 
     return True, ''
 
+
+def validate_prereview_prs(pr) -> tuple[bool, str]:
+    threads = pr.get("reviewThreads", {}).get("nodes", [])
+    if not threads:
+        return False, 'no_prereview_commits'
+    first_comment_dates = []
+    for thread in threads:
+        comment = thread["comments"]["nodes"][0]
+        first_comment_dates.append(comment["createdAt"])
+    if not first_comment_dates:
+        return False, 'no_prereview_commits'
+    first_review_date = min(first_comment_dates)
+    commit_nodes = pr.get("commits", {}).get("nodes", [])
+    diffs = pr.get("individual_commit_diffs", {})
+    pre_review_commits = [
+        n for n in commit_nodes
+        if not n["commit"]["message"].startswith("Merge")
+        and n["commit"]["committedDate"] <= first_review_date
+    ]
+    if not pre_review_commits:
+        return False, 'no_prereview_commits'
+    return True, ''
+
 def validate_and_fix_collisions():
     if os.path.exists(DEST_DIR):
         shutil.rmtree(DEST_DIR)
@@ -78,6 +101,7 @@ def validate_and_fix_collisions():
             'too_few_removed':0,   
             'diff_too_small':0,   
             'diff_too_large':0, 
+            'no_prereview_commits':0
         }
         for category in categories:
             cat_path = os.path.join(repo_path, category)
@@ -104,6 +128,12 @@ def validate_and_fix_collisions():
                 diff_ok, diff_reason = has_sufficient_changes(pr)
                 if not diff_ok:
                     rejections[diff_reason] += 1
+                    total_removed_by_category+=1
+                    continue
+
+                prereview_ok, prereview_reason = validate_prereview_prs(pr)
+                if not prereview_ok:
+                    rejections[prereview_reason] += 1
                     total_removed_by_category+=1
                     continue
 
