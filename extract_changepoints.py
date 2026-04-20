@@ -19,8 +19,8 @@ GITHUB_TOKEN = ""
 GOLDEN_DIR = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/FINAL_GOLDEN_SET"
 OUTPUT_DIR = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/CHANGEPOINT_SET"
 
-MAX_PRS = 1
-CATEGORY = "Performance"
+MAX_PRS = 0
+CATEGORY = ""
 GEMINI_MODEL = "gemini-2.5-pro"
 OPENAI_MODEL = "gpt-4o"
 ANTHROPIC_MODEL = "claude-sonnet-4-5"
