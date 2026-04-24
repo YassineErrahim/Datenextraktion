@@ -1,12 +1,23 @@
 import json
 import os
 import shutil
+import requests
+import re
 
+GITHUB_TOKEN = ""
 
 SOURCE_DIR = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/Master_Arbeit_Data"
 DEST_DIR   = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/FINAL_GOLDEN_SET"
 
 
+MIN_ADDED_LINES   = 5
+MIN_REMOVED_LINES = 1
+MIN_TOTAL_CHANGES = 10
+
+MAX_DIFF_LINES = 400
+
+MIN_DIFF_CHARS    = 50
+MAX_DIFF_CHARS = 64_000 * 4 # mmm for the max tokens context window, 4 charcters in average for a token
 
 def has_at_least_one_comment(pr):
     for thread in pr.get('reviewThreads', {}).get('nodes', []):
@@ -30,33 +41,50 @@ def analyse_diff(raw_diff: str) -> dict:
         'total':   added + removed,
     }
 
-MIN_ADDED_LINES   = 5
-MIN_REMOVED_LINES = 1
-MIN_TOTAL_CHANGES = 10
-MAX_TOTAL_CHANGES = 300
-MIN_DIFF_CHARS    = 50
 
-def has_sufficient_changes(pr) -> tuple[bool, str]:
-    head_sha = pr.get('headRefOid', '')
-    diff = pr.get('individual_commit_diffs', {}).get(head_sha, '')
-    if len(diff) < MIN_DIFF_CHARS:
-        return False, 'diff_too_short'
+def fetch_full_diff(owner: str, repo: str, pr_number: str) -> str:
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+    headers = {
+        "Accept": "application/vnd.github.v3.diff",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+    }
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp.text
 
-    stats = analyse_diff(diff)
+def extract_pr_url_parts(pr: dict) -> tuple[str, str, str]:
+    url = pr.get("url", "")
+    match = re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", url)
+    return match.group(1), match.group(2), match.group(3)
+
+def has_sufficient_changes(pr) -> tuple[bool, str, str]:
+    try:
+        owner, repo, pr_number = extract_pr_url_parts(pr)
+        full_diff = fetch_full_diff(owner, repo, pr_number)
+    except Exception as e:
+        return False, 'diff_too_large', ''
+    
+    if len(full_diff) > MAX_DIFF_CHARS:
+        return False, 'diff_too_large', ''
+    
+    if len(full_diff) < MIN_DIFF_CHARS:
+        return False, 'diff_too_short', ''
+
+    stats = analyse_diff(full_diff)
 
     if stats['added'] < MIN_ADDED_LINES:
-        return False, 'too_few_added'
+        return False, 'too_few_added', ''
 
     if stats['removed'] < MIN_REMOVED_LINES:
-        return False, 'too_few_removed'
+        return False, 'too_few_removed', ''
 
     if stats['total'] < MIN_TOTAL_CHANGES:
-        return False, 'diff_too_small'
+        return False, 'diff_too_small', ''
+    
+    if stats['total'] > MAX_DIFF_LINES:
+        return False, 'diff_too_many_lines', ''
 
-    if stats['total'] > MAX_TOTAL_CHANGES:
-        return False, 'diff_too_large'
-
-    return True, ''
+    return True, '', full_diff
 
 
 def validate_prereview_prs(pr) -> tuple[bool, str]:
@@ -71,7 +99,6 @@ def validate_prereview_prs(pr) -> tuple[bool, str]:
         return False, 'no_prereview_commits'
     first_review_date = min(first_comment_dates)
     commit_nodes = pr.get("commits", {}).get("nodes", [])
-    diffs = pr.get("individual_commit_diffs", {})
     pre_review_commits = [
         n for n in commit_nodes
         if not n["commit"]["message"].startswith("Merge")
@@ -101,6 +128,7 @@ def validate_and_fix_collisions():
             'too_few_removed':0,   
             'diff_too_small':0,   
             'diff_too_large':0, 
+            'diff_too_many_lines': 0,
             'no_prereview_commits':0
         }
         for category in categories:
@@ -125,7 +153,7 @@ def validate_and_fix_collisions():
                     total_removed_by_category+=1
                     continue
 
-                diff_ok, diff_reason = has_sufficient_changes(pr)
+                diff_ok, diff_reason, full_diff = has_sufficient_changes(pr)
                 if not diff_ok:
                     rejections[diff_reason] += 1
                     total_removed_by_category+=1
@@ -136,6 +164,8 @@ def validate_and_fix_collisions():
                     rejections[prereview_reason] += 1
                     total_removed_by_category+=1
                     continue
+
+                pr['full_diff'] = full_diff
 
                 dest_folder = os.path.join(DEST_DIR, category)
                 os.makedirs(dest_folder, exist_ok=True)
