@@ -10,20 +10,19 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-GEMINI_API_KEY = ""
+
+DEEPSEEK_API_KEY = ""
 OPENAI_API_KEY = ""
 ANTHROPIC_API_KEY = ""
-GITHUB_TOKEN = ""
-
 
 GOLDEN_DIR = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/FINAL_GOLDEN_SET"
 OUTPUT_DIR = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/CHANGEPOINT_SET"
 
 MAX_PRS = 0
 CATEGORY = ""
-GEMINI_MODEL = "gemini-2.5-pro"
 OPENAI_MODEL = "gpt-4o"
 ANTHROPIC_MODEL = "claude-sonnet-4-5"
+DEEPSEEK_MODEL = "deepseek-reasoner"
 
 VOTES_REQUIRED = 2
 TOTAL_VOTES = 3
@@ -76,108 +75,60 @@ Rules:
 - NO = the final diff shows no change related to this comment."""
 
 
-def fetch_full_diff(owner: str, repo: str, pr_number: str) -> str:
-    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
-    headers = {
-        "Accept": "application/vnd.github.v3.diff",
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-    }
-    resp = requests.get(url, headers=headers, timeout=60)
-    resp.raise_for_status()
-    return resp.text
-
-
-def extract_pr_url_parts(pr: dict) -> tuple[str, str, str]:
-    url = pr.get("url", "")
-    match = re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", url)
-    return match.group(1), match.group(2), match.group(3)
-
 
 def build_prompt(comment: ReviewerComment) -> str:
     return (
         "=== REVIEWER COMMENT ===\n"
         f"{comment.body}\n\n"
 
-        "=== COMMENT LOCATION (diff hunk where comment was posted, for context only) ===\n"
-        "```diff\n"
+        "=== Diff hunk ===\n"
         f"{comment.diff_hunk}\n"
-        "```\n\n"
 
         "=== FILE PATH ===\n"
         f"{comment.path}\n\n"
 
         "=== INSTRUCTIONS ===\n"
-        "1. First look in the diff hunk above for evidence the comment was addressed\n"
-        f"2. If not found in the diff hunk, search the file '{comment.path}' in the full PR diff\n"
-        "3. If still not found, search ALL other files in the full PR diff\n"
-        "4. The fix may be anywhere in the full diff — different location, different file, different section\n"
-        "5. Look for '+' lines (additions) or '-' lines (deletions) that relate to the reviewer comment\n"
+        "1. First look in the diff hunk above\n"
+        "2. If you find evidence about code-changes based on comment anywhere in the diff hunk → VERDICT: YES\n"
+        f"3. If any evidence not found in the diff hunk, search the file '{comment.path}' in the full PR diff\n"
+        f"4. If you find evidence about code-changes based on comment anywhere in the file '{comment.path}' → VERDICT: YES\n"
+        "5. If still not found, search ALL other files in the full PR diff — look for '+'/'-' lines related to the comment\n"
         "6. If you find evidence anywhere in the full diff → VERDICT: YES\n"
         "7. Only if absolutely no related change exists anywhere in the entire full diff → VERDICT: NO\n"
     )
 
-def call_gemini(comments: list[ReviewerComment], full_diff: str) -> list[str]:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    try:
-        cache = client.caches.create(
-            model=GEMINI_MODEL,
-            config=types.CreateCachedContentConfig(
-                display_name="pr_diff_cache",
-                system_instruction=SYSTEM_PROMPT,
-                contents=[f"=== FULL PR DIFF (all changes in this PR) ===\n{full_diff}"],
-                ttl="3600s",
-            ),
-        )
-        use_cache = True
-    except Exception as e:
-        if "too small" in str(e).lower() or "2048" in str(e) or "INVALID_ARGUMENT" in str(e):
-            use_cache = False
-        else:
-            raise
 
-    def call(prompt: str) -> str:
-        if use_cache:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    cached_content=cache.name,
-                    temperature=0.0,
-                    max_output_tokens=8192,
-                ),
-            )
-        else:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    temperature=0.0,
-                    max_output_tokens=8192,
-                ),
-            )
-        return (response.text or "").strip()
 
+def call_deepseek(comments: list[ReviewerComment], full_diff: str) -> list[str]:
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+    base_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"=== FULL PR DIFF (all changes in this PR) ===\n{full_diff}"},
+    ]
     results = []
-    try:
-        for comment in comments:
-            prompt = build_prompt(comment) if use_cache else (
-                f"=== FULL PR DIFF (all changes in this PR) ===\n{full_diff}\n\n{build_prompt(comment)}"
+    for comment in comments:
+        try:
+            resp = client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=base_messages + [{"role": "user", "content": build_prompt(comment)}],
+                temperature=0.0,
+                max_tokens=8000,
             )
-            try:
-                results.append(call(prompt))
-            except Exception as e:
-                if "rate" in str(e).lower() or "429" in str(e):
-                    time.sleep(61)
-                    results.append(call(prompt))
-                else:
-                    raise RuntimeError(f"Gemini call failed: {e}") from e
-    finally:
-        if use_cache:
-            client.caches.delete(name=cache.name)
-
+            results.append(resp.choices[0].message.content.strip() or "")
+        except Exception as e:
+            err = str(e).lower()
+            if "rate" in err or "429" in err or "resource_exhausted" in err:
+                time.sleep(61)
+                resp = client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=base_messages + [{"role": "user", "content": build_prompt(comment)}],
+                    temperature=0.0,
+                    max_tokens=8000,
+                )
+                results.append(resp.choices[0].message.content.strip() or "")
+            else:
+                raise RuntimeError(f"DeepSeek call failed: {e}") from e
     return results
-
 
 def call_openai(comments: list[ReviewerComment], full_diff: str) -> list[str]:
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -192,17 +143,18 @@ def call_openai(comments: list[ReviewerComment], full_diff: str) -> list[str]:
                 model=OPENAI_MODEL,
                 messages=base_messages + [{"role": "user", "content": build_prompt(comment)}],
                 temperature=0.0,
-                max_tokens=8192,
+                max_tokens=8000,
             )
             results.append(resp.choices[0].message.content.strip() or "")
         except Exception as e:
-            if "rate" in str(e).lower() or "429" in str(e):
+            err = str(e).lower()
+            if "rate" in err or "429" in err or "resource_exhausted" in err:
                 time.sleep(61)
                 resp = client.chat.completions.create(
                     model=OPENAI_MODEL,
                     messages=base_messages + [{"role": "user", "content": build_prompt(comment)}],
                     temperature=0.0,
-                    max_tokens=8192,
+                    max_tokens=8000,
                 )
                 results.append(resp.choices[0].message.content.strip() or "")
             else:
@@ -231,17 +183,18 @@ def call_anthropic(comments: list[ReviewerComment], full_diff: str) -> list[str]
         try:
             response = client.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=8192,
+                max_tokens=8000,
                 system=cached_system,
                 messages=[{"role": "user", "content": build_prompt(comment)}],
             )
             results.append(response.content[0].text.strip())
         except Exception as e:
-            if "rate" in str(e).lower() or "429" in str(e):
+            err = str(e).lower()
+            if "rate" in err or "429" in err or "resource_exhausted" in err:
                 time.sleep(61)
                 response = client.messages.create(
                     model=ANTHROPIC_MODEL,
-                    max_tokens=8192,
+                    max_tokens=8000,
                     system=cached_system,
                     messages=[{"role": "user", "content": build_prompt(comment)}],
                 )
@@ -252,29 +205,34 @@ def call_anthropic(comments: list[ReviewerComment], full_diff: str) -> list[str]
     return results
 
 def parse_response(text: str) -> str:
-    for line in text.strip().splitlines():
-        stripped = line.strip()
-        if stripped.startswith("VERDICT:"):
-            v = stripped.split(":", 1)[1].strip().upper()
-            if "YES" in v:
-                return "YES"
-    return "NO"
+    if not text or not text.strip():
+        raise ValueError("Empty response from model")
+    
+    upper = text.upper()
+    if "VERDICT: YES" in upper:
+        return "YES"
+    if "VERDICT: NO" in upper:
+        return "NO"
+    raise ValueError(f"Could not parse verdict from response: {text!r}")
 
 
 def majority_vote(comments: list[ReviewerComment], full_diff: str) -> list[LLMVerification]:
-    gemini_votes = call_gemini(comments, full_diff)
+    print("calling deepseek...", flush=True)
+    deepseek_votes = call_deepseek(comments, full_diff)
+    print("calling open ai...", flush=True)
     openai_votes = call_openai(comments, full_diff)
+    print("calling anthropic...", flush=True)
     anthropic_votes = call_anthropic(comments, full_diff)
     results = []
     for i in range(len(comments)):
-        votes = [gemini_votes[i], openai_votes[i], anthropic_votes[i]]
+        votes = [deepseek_votes[i], openai_votes[i], anthropic_votes[i]]
         parsed = [parse_response(v) for v in votes]
         yes_count = sum(1 for v in parsed if v == "YES")
         consensus = "YES" if yes_count >= VOTES_REQUIRED else "NO"
         confidence = round(yes_count / TOTAL_VOTES, 2)
         results.append(LLMVerification(
             votes = parsed,
-            models = [GEMINI_MODEL, OPENAI_MODEL, ANTHROPIC_MODEL],
+            models = [DEEPSEEK_MODEL, OPENAI_MODEL, ANTHROPIC_MODEL],
             consensus = consensus,
             confidence = confidence,
         ))
@@ -300,8 +258,9 @@ def extract_all_comments(pr: dict) -> list[ReviewerComment]:
 
 
 def extract_pr_changepoints(pr: dict, pr_result: PRResult) -> None:
-    owner, repo, pr_number = extract_pr_url_parts(pr)
-    full_diff = fetch_full_diff(owner, repo, pr_number)
+    full_diff =  pr.get('full_diff', '')
+    if not full_diff:
+        raise RuntimeError("full diff not found in PR data")
     comments = extract_all_comments(pr)
     verifications = majority_vote(comments, full_diff)
     print(f"\n\ncomments: {len(comments)}, verfications: {len(verifications)}")
@@ -311,8 +270,7 @@ def extract_pr_changepoints(pr: dict, pr_result: PRResult) -> None:
             reviewer_comment = comment,
             llm_verification = verification,
         )
-        pr_result.change_points.append(cp)
-    return full_diff    
+        pr_result.change_points.append(cp)    
 
 
 def to_dict(cp: ChangePoint) -> dict:
@@ -333,12 +291,11 @@ def to_dict(cp: ChangePoint) -> dict:
     }
 
 
-def save_pr(pr: dict, pr_result: PRResult, output_dir: Path, full_diff: str) -> None:
+def save_pr(pr: dict, pr_result: PRResult, output_dir: Path) -> None:
     dest_dir = output_dir / pr_result.category
     dest_dir.mkdir(parents=True, exist_ok=True)
     copy_pr = dict(pr)
     copy_pr["change_points"] = [to_dict(cp) for cp in pr_result.change_points]
-    copy_pr["full_diff"] = full_diff
     dest_path = dest_dir / Path(pr_result.filepath).name
     with open(dest_path, "w", encoding="utf-8") as f:
         json.dump(copy_pr, f, indent=2)
@@ -353,12 +310,11 @@ def main():
     ])
     if CATEGORY:
         all_files = [f for f in all_files if Path(f).parent.name == CATEGORY]
-    if MAX_PRS:
-        all_files = all_files[:MAX_PRS]
 
     total = len(all_files)
     print(f"Starting extraction: {total} PRs", flush=True)
 
+    processed = 0
     for i, filepath in enumerate(all_files, 1):
         fname = Path(filepath).stem
         parts = fname.rsplit("_pr_", 1)
@@ -369,7 +325,11 @@ def main():
         if dest.exists():
             print(f"already done {fname}", flush=True)
             continue
+        if MAX_PRS and processed >= MAX_PRS:
+            print(f"Reached MAX_PRS={MAX_PRS}, stopping.", flush=True)
+            break
 
+        processed += 1    
         try:
             with open(filepath, encoding="utf-8") as f:
                 pr = json.load(f)
@@ -388,8 +348,8 @@ def main():
         )
 
         try:
-            full_diff = extract_pr_changepoints(pr, pr_result)
-            save_pr(pr, pr_result, output, full_diff)
+            extract_pr_changepoints(pr, pr_result)
+            save_pr(pr, pr_result, output)
         except Exception as e:
             print(f"  [ERROR] {e}", flush=True)
 
