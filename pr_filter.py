@@ -16,6 +16,8 @@ MIN_TOTAL_CHANGES = 10
 
 MAX_DIFF_LINES = 400
 
+CATEGORIES = ["Quality", "Security", "Performance", "Refactor", "Testing"]
+
 MIN_DIFF_CHARS    = 50
 MAX_DIFF_CHARS = 64_000 * 4 # mmm for the max tokens context window, 4 charcters in average for a token
 
@@ -26,6 +28,7 @@ def has_at_least_one_comment(pr):
                 return True
 
     return False
+
 
 def analyse_diff(raw_diff: str) -> dict:
     added   = 0
@@ -108,11 +111,18 @@ def validate_prereview_prs(pr) -> tuple[bool, str]:
         return False, 'no_prereview_commits'
     return True, ''
 
+def check_duplication(unique_filename: str) -> bool:
+    for category in CATEGORIES:
+        path = os.path.join(DEST_DIR, category, unique_filename)
+        if os.path.exists(path):
+            return True
+    return False
+
+
 def validate_and_fix_collisions():
     if os.path.exists(DEST_DIR):
         shutil.rmtree(DEST_DIR)
     os.makedirs(DEST_DIR)
-    categories = ["Quality", "Security", "Performance", "Refactor", "Testing"]
 
     SKIP_DIRS = {"_clones", ".DS_Store"}
     for repo in sorted(os.listdir(SOURCE_DIR)):
@@ -131,7 +141,7 @@ def validate_and_fix_collisions():
             'diff_too_many_lines': 0,
             'no_prereview_commits':0
         }
-        for category in categories:
+        for category in CATEGORIES:
             cat_path = os.path.join(repo_path, category)
             total_removed_by_category = 0
             for file in sorted(os.listdir(cat_path)):
@@ -163,6 +173,10 @@ def validate_and_fix_collisions():
                 if not prereview_ok:
                     rejections[prereview_reason] += 1
                     total_removed_by_category+=1
+                    continue
+
+                unique_filename = f"{repo}_{file}"
+                if check_duplication(unique_filename):
                     continue
 
                 pr['full_diff'] = full_diff
