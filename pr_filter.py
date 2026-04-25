@@ -175,8 +175,7 @@ def validate_and_fix_collisions():
                     total_removed_by_category+=1
                     continue
 
-                unique_filename = f"{repo}_{file}"
-                if check_duplication(unique_filename):
+                if check_duplication(f"{repo}_{file}"):
                     continue
 
                 pr['full_diff'] = full_diff
