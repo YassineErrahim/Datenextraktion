@@ -11,11 +11,10 @@ DEFAULT_BASE_DIR = (
     "DataExtraction/CHANGEPOINT_SET"
 )
 
-GEMINI_API_KEY = ""
-
+GEMINI_API_KEY = "AIzaSyAonnmDeU8PvlYY_cycSWHT6D2dpVoco0k"
 
 base_dir = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/CHANGEPOINT_SET"
-sleep = 20.0
+sleep = 10.0
 force = False
 model_id = "gemini-2.5-flash"
 
@@ -64,7 +63,7 @@ Your only job is to judge WHETHER THAT COMMENT WAS SHALLOW OR MEANINGFUL.
 
 Title: {title}
 
-## YES-consensus change points
+## YES-consensus change points (these are your only input)
 
 {yes_change_points}
 
@@ -111,10 +110,12 @@ def format_yes_change_points(change_points):
 
 def classify_pr(pr_data):
     title = pr_data.get("title", "")
+
     yes_points = [
         cp for cp in pr_data.get("change_points", [])
         if cp["llm_verification"]["consensus"] == "YES"
     ]
+
     if not yes_points:
         return {
             "yes_count": 0,
@@ -137,6 +138,8 @@ def classify_pr(pr_data):
         config=config
     )
     raw = response.text.strip()
+
+    # strip markdown fences if present
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -146,7 +149,7 @@ def classify_pr(pr_data):
 
 
 def collect_pr_files(base_dir):
-    pattern = os.path.join(base_dir, "Performance", "*.json")
+    pattern = os.path.join(base_dir, "**", "*.json")
     return sorted(glob.glob(pattern, recursive=True))
 
 
@@ -192,8 +195,8 @@ def main():
 
     print(f"\n=== Done ===")
     print(f"  Classified : {done}")
-    print(f"  Skipped: {skipped}")
-    print(f"  Errors: {errors}")
+    print(f"  Skipped    : {skipped}")
+    print(f"  Errors     : {errors}")
 
 
 if __name__ == "__main__":
