@@ -11,7 +11,7 @@ DEFAULT_BASE_DIR = (
     "DataExtraction/CHANGEPOINT_SET"
 )
 
-GEMINI_API_KEY = "AIzaSyAonnmDeU8PvlYY_cycSWHT6D2dpVoco0k"
+GEMINI_API_KEY = ""
 
 base_dir = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/CHANGEPOINT_SET"
 sleep = 10.0
