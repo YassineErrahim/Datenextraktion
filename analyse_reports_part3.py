@@ -34,7 +34,6 @@ for model_dir in REPORTS_DIR.iterdir():
 common_files = set.intersection(*model_files.values()) if model_files else set()
 print(f"Common PRs: {len(common_files)}\n")
 
-# --- overview per model ---
 print("=" * 60)
 print("OVERVIEW PER MODEL")
 print("=" * 60)
@@ -90,7 +89,6 @@ for model_dir in sorted(REPORTS_DIR.iterdir()):
     print(f"  Avg tools    : {mean(tool_counts):.1f}")
     print(f"  Top tools    : {', '.join(f'{t}({c})' for t,c in top3) if top3 else '-'}")
 
-# --- breakdown by gt_quality_label ---
 for label in ["Substantive", "Shallow", "Noisy", "Documentation"]:
     print(f"\n{'=' * 60}")
     print(f"GT LABEL: {label}")
