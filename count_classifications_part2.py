@@ -22,7 +22,7 @@ for fpath in glob.glob(os.path.join(base_dir, "**", "*.json"), recursive=True):
         continue
 
     total_prs_with_yes += 1
-    total_yes_cps += len(yes_cps)  # count directly from source, not from classification
+    total_yes_cps += len(yes_cps)
 
     clf = pr.get("classification")
     if not clf:
