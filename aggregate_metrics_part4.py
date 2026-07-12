@@ -42,7 +42,6 @@ def load_judge_data():
 
 
 def load_quality_labels():
-    # Returns: {filename: gt_quality_label}
     result = {}
     for category in os.listdir(CHANGEPOINT_BASE):
         cat_path = os.path.join(CHANGEPOINT_BASE, category)
@@ -59,7 +58,6 @@ def load_quality_labels():
 
 
 def average_metrics(records):
-    # records: list of dicts with metric values
     n = len(records)
     if n == 0:
         return {}
@@ -91,15 +89,13 @@ def main():
     models = list(judge_data.keys())
     print(f"Models found: {models}\n")
 
-    # Common PRs across all models (Level 1)
     common_fnames = set(judge_data[models[0]].keys())
     for model in models[1:]:
         common_fnames &= set(judge_data[model].keys())
     print(f"Common PRs across all models: {len(common_fnames)}\n")
 
-    # --- Level 1: PR level ---
     print("=" * 60)
-    print("LEVEL 1 — PR LEVEL (all common PRs)")
+    print("LEVEL — PR LEVEL (all common PRs)")
     print("=" * 60)
     for model in models:
         records = [extract_record(model, fname, judge_data[model][fname]) for fname in common_fnames]
@@ -108,15 +104,13 @@ def main():
         for k, v in avg.items():
             print(f"  {k}: {round(v, 4) if isinstance(v, float) else v}")
 
-    # --- Level 2: Quality label level ---
     print("\n" + "=" * 60)
-    print("LEVEL 2 — QUALITY LABEL LEVEL")
+    print("LEVEL — QUALITY LABEL LEVEL")
     print("=" * 60)
 
     all_labels = ["Substantive", "Shallow", "Noisy", "Documentation"]
 
     for label in all_labels:
-        # PRs with this label, common across all models
         label_fnames = {fname for fname in quality_labels if quality_labels[fname] == label}
         common_label_fnames = label_fnames.copy()
         for model in models:
