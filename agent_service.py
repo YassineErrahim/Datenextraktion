@@ -19,24 +19,18 @@ try:
 except ImportError:
     _anthropic = None
 
-try:
-    import ollama as _ollama
-except ImportError:
-    _ollama = None
-
 
 
 REPO_CLONE_DIR = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/Master_Arbeit_Data/_clones"
 REPORTS_DIR = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/CODE_REVIEW_REPORTS"
-
 
 MESSAGES_DEBUG_DIR = "/Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/MESSAGES_DEBUG"
 
 ANTHROPIC_API_KEY = ""
 COMMERCIAL_MODELS = [
     {"provider": "anthropic", "model": "claude-sonnet-4-6"},
-    {"provider": "openai",    "model": "gpt-5.4"},
-    {"provider": "deepseek",  "model": "deepseek-v4-pro"}
+    {"provider": "openai", "model": "gpt-5.4"},
+    {"provider": "deepseek", "model": "deepseek-v4-pro"}
 ]
 
 ANTHROPIC_PRICE_INPUT_PER_M = 3.00   
@@ -57,14 +51,26 @@ DEEPSEEK_PRICE_CACHE_HIT_PER_M = 0.003625
 DEEPSEEK_PRICE_OUTPUT_PER_M  = 0.87
 
 
-OLLAMA_HOST = "http://localhost:11434"      # SSH tunnel: ssh -L 11434:localhost:11434 root@YOUR_IP -p YOUR_PORT -i /Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/runpodkey -N
-RUNPOD_BASE_URL = "http://localhost:11434/v1"   # (kept for reference, unused by ollama loop)
+# SSH tunnel: ssh -L 11434:localhost:11434 root@YOUR_IP -p YOUR_PORT -i /Users/yassine/Downloads/Master_Arbeit/Experiment/DataExtraction/runpodkey -N
+VLLM_BASE_URL = "http://64.247.206.204:49003/v1"
+VLLM_API_KEY  = "token-abc123"
 
 RUNPOD_MODELS = [
-    "qwen2.5-coder:32b-instruct-fp16",    
-    "llama3.1:70b",    
-    "gpt-oss:20b"
+    "Qwen/Qwen2.5-72B-Instruct-AWQ", #VLLM_CONTEXT_LIMIT = 131072
+    "neuralmagic/DeepSeek-R1-Distill-Llama-70B-quantized.w8a8", #VLLM_CONTEXT_LIMIT = 131072
+    "mistralai/Codestral-22B-v0.1", #VLLM_CONTEXT_LIMIT = 81920 (nativ context 32k)
+    "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4", #VLLM_CONTEXT_LIMIT = 131072,
+    "google/gemma-4-31b-it", # VLLM_CONTEXT_LIMIT = 163840
 ]
+VLLM_CONTEXT_LIMIT = 131072
+RUNPOD_MODEL_CONTEXT_LIMITS = {
+    "Qwen/Qwen2.5-72B-Instruct-AWQ": 131072,
+    "neuralmagic/DeepSeek-R1-Distill-Llama-70B-quantized.w8a8": 131072,
+    "mistralai/Codestral-22B-v0.1": 81920,
+    "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4": 131072,
+    "google/gemma-4-31b-it": 163840,
+}
+VLLM_MAX_OUTPUT = 8000
 
 MAX_TOOL_CALLS = 60
 REVIEW_TIMEOUT_S = 1800 # per-model hard timeout in seconds (30 min)
@@ -90,8 +96,6 @@ When NOT to use tools:
   - When the diff already gives you enough context to judge confidently
 
 ######## OUTPUT FORMAT ########
-
-When you have enough context, output ONLY a valid JSON object.
 No markdown fences. No text before or after. No extra keys.
 Any deviation from this schema will be treated as a failure — the response will be rejected and nothing will be saved.
 
@@ -107,6 +111,8 @@ Any deviation from this schema will be treated as a failure — the response wil
 }
 
 ######## RULES ########
+  - Keep tool calls minimal — use at absolutly maximum 60 tool calls only if needed to understand the context.
+  - When you have gathered enough information, stop calling tools and write your final report immediately. Do not call the same tool twice with the same arguments.
   - "findings" must be a list. Use [] if there is nothing that needs to change.
   - Only report a finding if it represents something that genuinely needs to change — do NOT report observations, praise, or notes about correct code.
   - Each finding must have exactly these two keys: "description" and "severity_score".
@@ -223,6 +229,7 @@ def prepare_repo(repo_name: str, base_ref_oid: str):
 def save_report(model_name: str, file_name: str, report: dict, category: str = "") -> str:
     if "error" in report:
         print(f"[save_report] skipping save for {file_name} — report has error: {report['error']}\n")
+        print(f"[save_report] full report: {json.dumps(report, indent=2)}\n")
         return None
     safe_model = re.sub(r"[:/\\]", "_", model_name)
     report_dir = os.path.join(REPORTS_DIR, safe_model, category)
@@ -388,54 +395,192 @@ def _is_tool_call(parsed: dict) -> bool:
         and "verdict" not in parsed
     )
 
-def run_opensource_loop(ollama_client, model, messages, repo_tools):
+def _force_final_review(vllm_client, model, messages, tool_log, total_input, total_output, file_name, reason: str):
+    print(f"[{model}] {reason} — forcing final review now ({len(tool_log)} tool calls so far)")
+    save_messages_debug(file_name, model, messages)
+    final_response = vllm_client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=VLLM_MAX_OUTPUT,
+        temperature=0.0,
+        timeout=480,
+    )
+    if final_response.usage:
+        total_input  += final_response.usage.prompt_tokens or 0
+        total_output += final_response.usage.completion_tokens or 0
+    content = (final_response.choices[0].message.content or "").strip()
+    report = parse_final_report(content)
+    return report, tool_log, total_input, total_output
+
+def run_opensource_loop(vllm_client, model, messages, repo_tools, file_name):
     tool_log = []
     total_input = 0
     total_output = 0
+    last_tool_call = None
+    tools_recently_added = 0
+    token_budget = int(RUNPOD_MODEL_CONTEXT_LIMITS.get(model, VLLM_CONTEXT_LIMIT) * 0.9)
 
     for iteration in range(MAX_TOOL_CALLS + 1):
+        response = None
         print(f"[{model}] iteration {iteration}")
-
-        response = ollama_client.chat(
-            model=model,
-            messages=messages,
-            tools=TOOLS_OPENAI,
-        )
-        msg = response.message
-        if response.prompt_eval_count is not None:
-            total_input += response.prompt_eval_count or 0
-            total_output += response.eval_count or 0
-
-        tool_calls = msg.tool_calls or []
-
-        if tool_calls:
+        if total_input >= token_budget:
+            if tools_recently_added > 0:
+                del messages[-tools_recently_added:]
             messages.append({
-                "role": msg.role,
-                "content": msg.content or "",
-                "tool_calls": [
-                    {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in tool_calls
-                ],
+                "role": "user",
+                "content": "Based on the information you have gathered so far, write your code review report now based on diff gived and results of tool calls. Output ONLY the JSON object following the schema in the system prompt."
             })
+            return _force_final_review(
+                vllm_client, model, messages, tool_log,
+                total_input, total_output, file_name,
+                f"token budget reached estimated tokens"
+            )
 
-            for tc in tool_calls:
-                name = tc.function.name
-                args = tc.function.arguments or {}  # already a dict in ollama
+        try:
+            kwargs = {
+                "model": model,
+                "messages": messages,
+                "tools": TOOLS_OPENAI,
+                "tool_choice": "auto",
+                "max_tokens": 8000,
+                "temperature": 0.0,
+                "timeout": 480,
+            }
+            response = vllm_client.chat.completions.create(**kwargs)
+        except Exception as e:
+            print(f"exception trigered here: {e}\n\n")
+            if "maximum context length" in str(e):
+                print(f"[{model}] context exceeded on API call — removing last message and forcing review")
+                if tools_recently_added > 0:
+                    del messages[-tools_recently_added:]
+                messages.append({
+                    "role": "user",
+                    "content": "Based on the information you have gathered so far, write your code review report now. Output ONLY the JSON object following the schema in the system prompt."
+                })
+                return _force_final_review(
+                    vllm_client, model, messages, tool_log,
+                    total_input, total_output, file_name,
+                    "context length exceeded — last calltools called removed"
+                )
+            else:
+                raise
+
+        if response.usage:
+            total_input  += response.usage.prompt_tokens or 0
+            total_output += response.usage.completion_tokens or 0
+
+        choice  = response.choices[0]
+        message = choice.message
+
+        messages.append(message.model_dump(exclude_unset=True))
+        if choice.finish_reason == "tool_calls" or (choice.finish_reason == "stop" and message.tool_calls):    
+            for tc in message.tool_calls:
+                name   = tc.function.name
+                args   = json.loads(tc.function.arguments or "{}")
+                current_call = (name, json.dumps(args, sort_keys=True))
+                if current_call == last_tool_call:
+                    print(f"[{model}] duplicate tool call detected ({name})")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps({"error": "You already called this tool with the same arguments."}),
+                    })
+                    continue                    
+                
+                last_tool_call = current_call
                 print(f"[{model}] tool: {name}({args})")
                 tool_log.append({"tool": name, "args": args, "iteration": iteration})
                 result = repo_tools.dispatch(name, args)
-                messages.append({"role": "tool", "content": result, "name": name})
-
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+            tools_recently_added = len(message.tool_calls)
             continue
 
-        content = (msg.content or "").strip()
+        content = (message.content or "").strip()
         print(f"[{model}] done — {iteration} iterations, {len(tool_log)} tool calls | input={total_input} output={total_output} tokens")
-        return parse_final_report(content), tool_log, total_input, total_output
+        save_messages_debug(file_name, model, messages)
+        try:
+            report = parse_final_report(content)
+            return report, tool_log, total_input, total_output
+        except json.JSONDecodeError:
+            print(f"[{model}] response was not valid JSON report, sending correction message")
+            messages.append({
+                "role": "user",
+                "content": "Your response must be a valid JSON object only. No markdown, no explanation. Output ONLY the JSON following the schema provided in the system prompt with keys if you finisch review and tool calls.",
+            })
+            continue
 
     raise RuntimeError(f"[{model}] exceeded {MAX_TOOL_CALLS} tool calls")
 
+def _extract_report_json(text: str) -> dict | None:
+    text = text.replace('\u0120', ' ').replace('\u010a', '\n').replace('\u010A', '\n')
+    text = text.replace('\u201c', '"').replace('\u201d', '"').replace('\u2018', "'").replace('\u2019', "'")
+
+    start_match = re.search(r'\{\s*"findings"', text)
+    if not start_match:
+        return None
+
+    end_match = re.search(r'"verdict"\s*:\s*"[^"]*"\s*\}', text[start_match.start():])
+    if not end_match:
+        return None
+
+    end = start_match.start() + end_match.end()
+    chunk = text[start_match.start():end]
+
+    try:
+        return json.loads(chunk)
+    except json.JSONDecodeError:
+        pass
+
+    def fix_string_values(s):
+        result = []
+        i = 0
+        while i < len(s):
+            if s[i] == '"':
+                result.append('"')
+                i += 1
+                while i < len(s):
+                    if s[i] == '\\' and i + 1 < len(s):
+                        next_char = s[i+1]
+                        if next_char in ('"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'):
+                            result.append(s[i])
+                            result.append(next_char)
+                            i += 2
+                        else:
+                            result.append('\\\\')
+                            i += 1
+                    elif s[i] == '"':
+                        rest = s[i+1:].lstrip()
+                        if rest and rest[0] in ':,]}\n\r ':
+                            result.append('"')
+                            i += 1
+                            break
+                        else:
+                            result.append('\\"')
+                            i += 1
+                    else:
+                        result.append(s[i])
+                        i += 1
+            else:
+                result.append(s[i])
+                i += 1
+        return ''.join(result)
+
+    try:
+        return json.loads(fix_string_values(chunk))
+    except json.JSONDecodeError:
+        return None
+    
 def parse_json_response(text: str) -> dict:
     text = (text or "").strip()
+
+    result = _extract_report_json(text)
+    if result is not None:
+        return result
+    print(f"[extract_report_json] not working check the report: \n{text}\n")
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -648,8 +793,8 @@ def run_anthropic_loop(client, model, messages, repo_tools, file_name):
                 })
             messages.append({"role": "user", "content": tool_results})
             if iteration > 0 and iteration % SLEEP_AFTER_HOW_MUCH_ITERATIONS == 0:
-                time.sleep(5)
-                sleep_s += 5
+                time.sleep(60)
+                sleep_s += 60
             continue
 
         raise RuntimeError(f"[{model}] unexpected stop_reason: {response.stop_reason}")
@@ -683,7 +828,7 @@ def review_with_model(provider, llm_client, model, user_prompt, repo_tools, file
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt}]
-            report, tool_log, total_input, total_output = run_opensource_loop(llm_client, model, messages, repo_tools)
+            report, tool_log, total_input, total_output = run_opensource_loop(llm_client, model, messages, repo_tools, file_name)
             cache_read = 0
             cache_creation = 0
             sleep_s = 0
@@ -772,8 +917,6 @@ def create_app(provider: str) -> Flask:
             raise RuntimeError("pip install anthropic")
         if OpenAI is None:
             raise RuntimeError("pip install openai")
-        if _ollama is None:
-            raise RuntimeError("pip install ollama")
 
         anthropic_client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         openai_client    = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL) if OPENAI_API_KEY else None
@@ -801,9 +944,9 @@ def create_app(provider: str) -> Flask:
             raise RuntimeError("COMMERCIAL_MODELS is empty — uncomment at least one model")
 
     elif provider == "opensource":
-        ollama_client = _ollama.Client(host=OLLAMA_HOST)
+        vllm_client = OpenAI(api_key=VLLM_API_KEY, base_url=VLLM_BASE_URL)
         clients = [
-            {"provider": "opensource", "model": model, "client": ollama_client}
+            {"provider": "opensource", "model": model, "client": vllm_client}
             for model in RUNPOD_MODELS
         ]
         if not clients:
