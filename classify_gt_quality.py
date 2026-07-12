@@ -138,8 +138,6 @@ def classify_pr(pr_data):
         config=config
     )
     raw = response.text.strip()
-
-    # strip markdown fences if present
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
